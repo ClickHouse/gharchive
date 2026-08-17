@@ -24,14 +24,25 @@ PAGES = (1..3).to_a
 # that reads page 1 alone therefore captures pushes and silently drops almost
 # everything else.
 #
-# Measured turnover (2026-08): page 1 replaces all 100 entries in well under a
-# second, pages 2 and 3 in one to two seconds. Every page is polled on its own
-# schedule, so a busy page 1 cannot delay the others.
+# A single response is an unordered sample of the recent window rather than the
+# strict newest 100, so two adjacent responses can barely overlap while their
+# union still covers everything. What matters is the aggregate: measured on page
+# 1 in 2026-08 over 20 second windows,
 #
-# The defaults cost 4 requests/second - 14400/hour, which one GitHub App
-# installation (15000/hour) or three user tokens can serve. Page 1 alone runs at
-# over 190 events/second, so pushes cannot be captured completely through this
-# endpoint at any affordable polling rate; pages 2 and 3 can.
+#   interval  requests/s  events/s captured  overlap  largest timestamp gap
+#      0.5 s        1.80              100.0      46%                  1.0 s
+#      2.0 s        0.50               50.0       0%                  2.0 s
+#      4.0 s        0.25               25.0       0%                  4.0 s
+#
+# The stream runs at about 100 events/second, so polling twice a second captures
+# all of it with margin to spare, while polling every two seconds returns a full
+# page of 100 unrelated events every time and silently drops the rest. Polling
+# harder buys nothing: four concurrent workers at 7.7 requests/second found one
+# extra event over a single worker at 1.9 requests/second.
+#
+# Every page is polled on its own schedule, so a busy page 1 cannot delay the
+# others. The defaults cost 4 requests/second - 14400/hour - which one GitHub App
+# installation (15000/hour) or three user tokens can serve.
 PAGE_INTERVALS = {
   1 => (ENV['PAGE1_INTERVAL'] || 0.5).to_f,
   2 => (ENV['PAGE23_INTERVAL'] || 1.0).to_f,
@@ -81,7 +92,6 @@ EM.run do
   @due = {}
   @token = 0
   @stats = Hash.new(0)
-  @warned = {}
   @paused_until = nil
 
   PAGES.each { |page| @due[page] = Time.now }
@@ -173,26 +183,24 @@ EM.run do
     @stats[:events] += fresh.size
     @stats[:polls] += 1
 
-    # Every entry of the page being new means the window turned over completely
-    # between two polls, so events in between were never seen. This is the check
-    # that PAGE_LIMIT = 500 disabled: it compared against a limit the API can
-    # never return, so it could not fire.
-    if !events.empty? && fresh.size == events.size && @seen.size > events.size
-      @stats[:"saturated_page#{page}"] += 1
-      # Page 1 is expected to saturate - it moves faster than the API can serve
-      # to one client - so keep this to one line a minute per page.
-      if @warned[page].nil? || Time.now - @warned[page] > 60
-        @warned[page] = Time.now
-        @log.warn "Page #{page} turned over completely between polls " \
-                  "(#{fresh.size}/#{events.size} new) - events in between were missed"
-      end
-    end
+    # Completeness signal. A single poll returning nothing but new events proves
+    # nothing, because responses are unordered samples - but if that holds across
+    # a whole minute then consecutive polls never overlap, which means the stream
+    # advanced further than one page between them and the difference was lost.
+    # This replaces the check that PAGE_LIMIT = 500 disabled: it compared against
+    # a limit the API can never return, so it could not fire.
+    @stats[:"seen_page#{page}"] += events.size
+    @stats[:"dup_page#{page}"] += events.size - fresh.size
 
     check_budget.call(req.response_header)
   end
 
   poll = lambda do |page|
     @inflight[page] = true
+    # Schedule the next poll from the moment the request goes out, not from the
+    # moment it comes back: adding the interval to the completion time silently
+    # stretches it by a whole round trip, which halved the effective rate.
+    started = Time.now
     url = "https://api.github.com/events?per_page=#{PAGE_LIMIT}&page=#{page}"
     req = HttpRequest.new(url, {
       :inactivity_timeout => 5,
@@ -214,14 +222,14 @@ EM.run do
         @log.error "Failed to process page #{page}: #{e}, #{e.backtrace.first(5)}"
       ensure
         @inflight[page] = false
-        @due[page] = Time.now + PAGE_INTERVALS[page]
+        @due[page] = started + PAGE_INTERVALS[page]
       end
     end
 
     req.errback do
       @log.error "Error fetching page #{page}: #{req.response_header.status}, #{req.error}"
       @inflight[page] = false
-      @due[page] = Time.now + PAGE_INTERVALS[page]
+      @due[page] = started + PAGE_INTERVALS[page]
     end
   end
 
@@ -236,10 +244,21 @@ EM.run do
   end
 
   EM.add_periodic_timer(60) do
-    saturated = PAGES.map { |p| "p#{p}:#{@stats[:"saturated_page#{p}"]}" }.join(' ')
+    overlap = PAGES.map do |p|
+      seen = @stats[:"seen_page#{p}"]
+      seen.zero? ? "p#{p}:-" : "p#{p}:#{(100 * @stats[:"dup_page#{p}"] / seen)}%"
+    end.join(' ')
     @log.info "Last minute: #{@stats[:events]} events archived over #{@stats[:polls]} polls " \
               "(#{@stats[:not_modified]} not modified), #{@seen.size} ids remembered, " \
-              "polls that saturated: #{saturated}"
+              "overlap #{overlap}"
+    PAGES.each do |p|
+      seen = @stats[:"seen_page#{p}"]
+      next if seen < 200
+      next if 100 * @stats[:"dup_page#{p}"] / seen >= 5
+      @log.warn "Page #{p} polls did not overlap at all over the last minute - " \
+                "the stream is outrunning the poll interval and events are being " \
+                "lost. Lower PAGE#{p == 1 ? '1' : '23'}_INTERVAL."
+    end
     StatHat.new.ez_count('Github Events', @stats[:events]) if ENV['STATHATKEY']
     @stats.clear
   end
